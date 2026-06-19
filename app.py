@@ -1,7 +1,8 @@
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
-import sqlite3
+import mysql.connector
+from mysql.connector import Error
 import os
 import glob
 from datetime import datetime
@@ -13,7 +14,15 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'inventory-dev-secret-change-in-production')
 CORS(app, supports_credentials=True)
 
-DATABASE = os.environ.get('DATABASE_PATH', os.path.join(BASE_DIR, 'inventory.db'))
+# MySQL Database Configuration
+DB_CONFIG = {
+    'host': os.environ.get('DB_HOST', 'localhost'),
+    'user': os.environ.get('DB_USER', 'root'),
+    'password': os.environ.get('DB_PASSWORD', ''),
+    'database': os.environ.get('DB_NAME', 'inventory_system'),
+    'port': int(os.environ.get('DB_PORT', 3306))
+}
+
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'static', 'uploads', 'avatars')
 ALLOWED_AVATAR_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 MAX_AVATAR_SIZE = 2 * 1024 * 1024  # 2 MB
@@ -21,71 +30,90 @@ MAX_AVATAR_SIZE = 2 * 1024 * 1024  # 2 MB
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        return conn
+    except Error as err:
+        print(f"Error connecting to MySQL: {err}")
+        raise
+
+def get_db_connection_no_db():
+    """Connect to MySQL without specifying a database (for initial setup)"""
+    try:
+        config = DB_CONFIG.copy()
+        config.pop('database')  # Remove database parameter
+        conn = mysql.connector.connect(**config)
+        return conn
+    except Error as err:
+        print(f"Error connecting to MySQL: {err}")
+        raise
 
 def init_db():
-    """Initialize the database with required tables"""
-    conn = get_db_connection()
-    c = conn.cursor()
+    """Initialize the MySQL database with required tables"""
+    try:
+        # First, connect without specifying database to create it
+        conn = get_db_connection_no_db()
+        c = conn.cursor()
+        
+        # Create database if not exists
+        db_name = DB_CONFIG['database']
+        c.execute(f"CREATE DATABASE IF NOT EXISTS {db_name}")
+        conn.commit()
+        c.close()
+        conn.close()
+        print(f"✓ Database '{db_name}' ready")
+        
+        # Now connect to the database and create tables
+        conn = get_db_connection()
+        c = conn.cursor()
 
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        full_name TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'admin',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(255) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            full_name VARCHAR(255) NOT NULL,
+            role VARCHAR(50) NOT NULL DEFAULT 'admin',
+            profile_pic VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
 
-    c.execute('''CREATE TABLE IF NOT EXISTS inventory (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        description TEXT NOT NULL,
-        model TEXT,
-        specs TEXT,
-        date_acquired DATE,
-        amount REAL,
-        rv_number TEXT UNIQUE,
-        po_number TEXT,
-        acquired_by TEXT,
-        location_installed TEXT,
-        remarks TEXT,
-        date_entry DATETIME DEFAULT CURRENT_TIMESTAMP,
-        entry_by TEXT,
-        user_id INTEGER,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS inventory (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            description VARCHAR(500) NOT NULL,
+            model VARCHAR(255),
+            specs TEXT,
+            date_acquired DATE,
+            amount DECIMAL(10, 2),
+            rv_number VARCHAR(255) UNIQUE NOT NULL,
+            po_number VARCHAR(255),
+            acquired_by VARCHAR(255),
+            location_installed VARCHAR(500),
+            remarks TEXT,
+            date_entry DATETIME DEFAULT CURRENT_TIMESTAMP,
+            entry_by VARCHAR(255),
+            user_id INT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE SET NULL
+        )''')
 
-    # Migrate existing databases
-    c.execute("PRAGMA table_info(inventory)")
-    columns = {row[1] for row in c.fetchall()}
-    if 'user_id' not in columns:
-        c.execute('ALTER TABLE inventory ADD COLUMN user_id INTEGER')
+        # Check if profile_pic column exists
+        c.execute("SHOW COLUMNS FROM users LIKE 'profile_pic'")
+        if not c.fetchone():
+            c.execute('ALTER TABLE users ADD COLUMN profile_pic VARCHAR(255)')
 
-    c.execute("PRAGMA table_info(users)")
-    user_columns = {row[1] for row in c.fetchall()}
-    if 'profile_pic' not in user_columns:
-        c.execute('ALTER TABLE users ADD COLUMN profile_pic TEXT')
+        conn.commit()
+        conn.close()
+        print("✓ Database initialized successfully")
+    except Error as err:
+        print(f"Error initializing database: {err}")
+        raise
 
-    c.execute(
-        "SELECT id FROM users WHERE username = 'admin' AND full_name = 'System Administrator'"
-    )
-    default_admin = c.fetchone()
-    if default_admin:
-        c.execute('UPDATE inventory SET user_id = NULL WHERE user_id = ?', (default_admin['id'],))
-        c.execute('DELETE FROM users WHERE id = ?', (default_admin['id'],))
-
-    conn.commit()
-    conn.close()
-
-def dict_from_row(row):
-    """Convert sqlite3.Row to dictionary"""
+def dict_from_row(cursor, row):
+    """Convert MySQL cursor result to dictionary"""
     if row is None:
         return None
-    return dict(row)
+    return dict(zip([desc[0] for desc in cursor.description], row))
 
 def validate_inventory_item(data):
     """Return the first missing required field label, or None if valid."""
@@ -133,8 +161,9 @@ def allowed_avatar_file(filename):
 def get_user_item_count(user_id):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT COUNT(*) as count FROM inventory WHERE user_id = ?', (user_id,))
-    count = c.fetchone()['count']
+    c.execute('SELECT COUNT(*) as count FROM inventory WHERE user_id = %s', (user_id,))
+    result = c.fetchone()
+    count = result[0] if result else 0
     conn.close()
     return count
 
@@ -148,11 +177,11 @@ def get_current_user():
                   COUNT(i.id) as item_count
            FROM users u
            LEFT JOIN inventory i ON i.user_id = u.id
-           WHERE u.id = ?
+           WHERE u.id = %s
            GROUP BY u.id''',
         (session['user_id'],)
     )
-    user = dict_from_row(c.fetchone())
+    user = dict_from_row(c, c.fetchone())
     conn.close()
     return user
 
@@ -194,25 +223,29 @@ def auth_login():
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE username = ?', (username,))
+    c.execute('SELECT * FROM users WHERE username = %s', (username,))
     user = c.fetchone()
     conn.close()
 
-    if user is None or not check_password_hash(user['password_hash'], password):
+    if user is None:
+        return jsonify({'error': 'Invalid username or password'}), 401
+    
+    user_dict = dict_from_row(c, user)
+    if not check_password_hash(user_dict['password_hash'], password):
         return jsonify({'error': 'Invalid username or password'}), 401
 
-    session['user_id'] = user['id']
-    session['username'] = user['username']
-    session['full_name'] = user['full_name']
-    session['role'] = user['role']
+    session['user_id'] = user_dict['id']
+    session['username'] = user_dict['username']
+    session['full_name'] = user_dict['full_name']
+    session['role'] = user_dict['role']
 
     return jsonify({
         'message': 'Login successful',
         'user': {
-            'id': user['id'],
-            'username': user['username'],
-            'full_name': user['full_name'],
-            'role': user['role']
+            'id': user_dict['id'],
+            'username': user_dict['username'],
+            'full_name': user_dict['full_name'],
+            'role': user_dict['role']
         }
     }), 200
 
@@ -232,13 +265,16 @@ def auth_register():
     c = conn.cursor()
     try:
         c.execute(
-            'INSERT INTO users (username, password_hash, full_name, role) VALUES (?, ?, ?, ?)',
+            'INSERT INTO users (username, password_hash, full_name, role) VALUES (%s, %s, %s, %s)',
             (username, generate_password_hash(password), full_name, 'admin')
         )
         conn.commit()
         user_id = c.lastrowid
-    except sqlite3.IntegrityError:
-        return jsonify({'error': 'Username already exists'}), 400
+    except Error as e:
+        conn.close()
+        if 'Duplicate entry' in str(e):
+            return jsonify({'error': 'Username already exists'}), 400
+        return jsonify({'error': str(e)}), 500
     finally:
         conn.close()
 
@@ -285,13 +321,13 @@ def auth_update_profile():
     conn = get_db_connection()
     c = conn.cursor()
 
-    c.execute('SELECT id FROM users WHERE username = ? AND id != ?', (username, user_id))
+    c.execute('SELECT id FROM users WHERE username = %s AND id != %s', (username, user_id))
     if c.fetchone():
         conn.close()
         return jsonify({'error': 'Username already taken'}), 400
 
     c.execute(
-        'UPDATE users SET username = ?, full_name = ? WHERE id = ?',
+        'UPDATE users SET username = %s, full_name = %s WHERE id = %s',
         (username, full_name, user_id)
     )
     conn.commit()
@@ -333,7 +369,7 @@ def auth_upload_avatar():
     profile_pic = f'/static/uploads/avatars/{filename}'
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('UPDATE users SET profile_pic = ? WHERE id = ?', (profile_pic, user_id))
+    c.execute('UPDATE users SET profile_pic = %s WHERE id = %s', (profile_pic, user_id))
     conn.commit()
     conn.close()
 
@@ -348,7 +384,7 @@ def auth_remove_avatar():
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('UPDATE users SET profile_pic = NULL WHERE id = ?', (user_id,))
+    c.execute('UPDATE users SET profile_pic = NULL WHERE id = %s', (user_id,))
     conn.commit()
     conn.close()
 
@@ -369,14 +405,16 @@ def auth_change_password():
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT password_hash FROM users WHERE id = ?', (session['user_id'],))
-    user = c.fetchone()
+    c.execute('SELECT password_hash FROM users WHERE id = %s', (session['user_id'],))
+    result = c.fetchone()
+    user = dict_from_row(c, result) if result else None
+    
     if user is None or not check_password_hash(user['password_hash'], current_password):
         conn.close()
         return jsonify({'error': 'Current password is incorrect'}), 401
 
     c.execute(
-        'UPDATE users SET password_hash = ? WHERE id = ?',
+        'UPDATE users SET password_hash = %s WHERE id = %s',
         (generate_password_hash(new_password), session['user_id'])
     )
     conn.commit()
@@ -396,8 +434,10 @@ def auth_delete_account():
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT password_hash FROM users WHERE id = ?', (user_id,))
-    user = c.fetchone()
+    c.execute('SELECT password_hash FROM users WHERE id = %s', (user_id,))
+    result = c.fetchone()
+    user = dict_from_row(c, result) if result else None
+    
     if user is None or not check_password_hash(user['password_hash'], password):
         conn.close()
         return jsonify({'error': 'Incorrect password'}), 401
@@ -410,7 +450,7 @@ def auth_delete_account():
         }), 400
 
     delete_user_avatar(user_id)
-    c.execute('DELETE FROM users WHERE id = ?', (user_id,))
+    c.execute('DELETE FROM users WHERE id = %s', (user_id,))
     conn.commit()
     conn.close()
 
@@ -435,7 +475,7 @@ def admin_get_users():
             GROUP BY u.id
             ORDER BY u.role DESC, u.full_name ASC
         ''')
-        users = [dict_from_row(row) for row in c.fetchall()]
+        users = [dict_from_row(c, row) for row in c.fetchall()]
         conn.close()
         return jsonify(users), 200
     except Exception as e:
@@ -449,17 +489,18 @@ def admin_get_user_inventory(user_id):
         conn = get_db_connection()
         c = conn.cursor()
 
-        c.execute('SELECT id, username, full_name, role FROM users WHERE id = ?', (user_id,))
-        user = dict_from_row(c.fetchone())
+        c.execute('SELECT id, username, full_name, role FROM users WHERE id = %s', (user_id,))
+        result = c.fetchone()
+        user = dict_from_row(c, result) if result else None
         if user is None:
             conn.close()
             return jsonify({'error': 'User not found'}), 404
 
         c.execute(
-            'SELECT * FROM inventory WHERE user_id = ? ORDER BY date_entry DESC',
+            'SELECT * FROM inventory WHERE user_id = %s ORDER BY date_entry DESC',
             (user_id,)
         )
-        items = [dict_from_row(row) for row in c.fetchall()]
+        items = [dict_from_row(c, row) for row in c.fetchall()]
         conn.close()
 
         return jsonify({'user': user, 'items': items}), 200
@@ -483,18 +524,18 @@ def get_inventory():
         params = []
 
         if search:
-            query += " AND (description LIKE ? OR model LIKE ? OR rv_number LIKE ?)"
+            query += " AND (description LIKE %s OR model LIKE %s OR rv_number LIKE %s)"
             search_term = f"%{search}%"
             params.extend([search_term, search_term, search_term])
 
         if location:
-            query += " AND location_installed LIKE ?"
+            query += " AND location_installed LIKE %s"
             params.append(f"%{location}%")
 
         query += " ORDER BY date_entry DESC"
 
         c.execute(query, params)
-        items = [dict_from_row(row) for row in c.fetchall()]
+        items = [dict_from_row(c, row) for row in c.fetchall()]
         conn.close()
 
         return jsonify(items), 200
@@ -508,8 +549,9 @@ def get_inventory_item(item_id):
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT * FROM inventory WHERE id = ?", (item_id,))
-        item = dict_from_row(c.fetchone())
+        c.execute("SELECT * FROM inventory WHERE id = %s", (item_id,))
+        result = c.fetchone()
+        item = dict_from_row(c, result) if result else None
         conn.close()
 
         if item is None:
@@ -539,7 +581,7 @@ def create_inventory_item():
         c.execute('''INSERT INTO inventory
             (description, model, specs, date_acquired, amount, rv_number,
              po_number, acquired_by, location_installed, remarks, entry_by, user_id, date_entry)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
             (
                 data.get('description'),
                 data.get('model'),
@@ -562,8 +604,10 @@ def create_inventory_item():
         conn.close()
 
         return jsonify({'id': item_id, 'message': 'Item created successfully'}), 201
-    except sqlite3.IntegrityError:
-        return jsonify({'error': 'RV# already exists'}), 400
+    except Error as e:
+        if 'Duplicate entry' in str(e):
+            return jsonify({'error': 'RV# already exists'}), 400
+        return jsonify({'error': str(e)}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -581,7 +625,7 @@ def update_inventory_item(item_id):
         conn = get_db_connection()
         c = conn.cursor()
 
-        c.execute("SELECT id FROM inventory WHERE id = ?", (item_id,))
+        c.execute("SELECT id FROM inventory WHERE id = %s", (item_id,))
         if c.fetchone() is None:
             conn.close()
             return jsonify({'error': 'Item not found'}), 404
@@ -593,7 +637,7 @@ def update_inventory_item(item_id):
                       'rv_number', 'po_number', 'acquired_by', 'location_installed',
                       'remarks']:
             if field in data:
-                update_fields.append(f"{field} = ?")
+                update_fields.append(f"{field} = %s")
                 params.append(data[field])
 
         if not update_fields:
@@ -603,7 +647,7 @@ def update_inventory_item(item_id):
         update_fields.append("updated_at = CURRENT_TIMESTAMP")
         params.append(item_id)
 
-        query = f"UPDATE inventory SET {', '.join(update_fields)} WHERE id = ?"
+        query = f"UPDATE inventory SET {', '.join(update_fields)} WHERE id = %s"
         c.execute(query, params)
         conn.commit()
         conn.close()
@@ -620,12 +664,12 @@ def delete_inventory_item(item_id):
         conn = get_db_connection()
         c = conn.cursor()
 
-        c.execute("SELECT id FROM inventory WHERE id = ?", (item_id,))
+        c.execute("SELECT id FROM inventory WHERE id = %s", (item_id,))
         if c.fetchone() is None:
             conn.close()
             return jsonify({'error': 'Item not found'}), 404
 
-        c.execute("DELETE FROM inventory WHERE id = ?", (item_id,))
+        c.execute("DELETE FROM inventory WHERE id = %s", (item_id,))
         conn.commit()
         conn.close()
 
@@ -650,7 +694,7 @@ def export_csv():
             conn.close()
             return jsonify({'error': 'No items to export'}), 404
 
-        fieldnames = [description[0] for description in c.description]
+        fieldnames = [desc[0] for desc in c.description]
         conn.close()
 
         output = StringIO()
@@ -658,7 +702,8 @@ def export_csv():
         writer.writeheader()
 
         for row in rows:
-            writer.writerow(dict(row))
+            row_dict = dict(zip(fieldnames, row))
+            writer.writerow(row_dict)
 
         return output.getvalue(), 200, {
             'Content-Disposition': 'attachment; filename="inventory.csv"',
@@ -676,19 +721,22 @@ def get_stats():
         c = conn.cursor()
 
         c.execute("SELECT COUNT(*) as total_items FROM inventory")
-        total = c.fetchone()['total_items']
+        result = c.fetchone()
+        total = result[0] if result else 0
 
         c.execute("SELECT SUM(amount) as total_value FROM inventory WHERE amount IS NOT NULL")
-        value = c.fetchone()['total_value'] or 0
+        result = c.fetchone()
+        value = result[0] if result and result[0] else 0
 
         c.execute("SELECT COUNT(DISTINCT location_installed) as locations FROM inventory WHERE location_installed IS NOT NULL")
-        locations = c.fetchone()['locations']
+        result = c.fetchone()
+        locations = result[0] if result else 0
 
         conn.close()
 
         return jsonify({
             'total_items': total,
-            'total_value': value,
+            'total_value': float(value) if value else 0,
             'locations': locations
         }), 200
     except Exception as e:
